@@ -135,6 +135,10 @@ Re-run it after pulling changes; it asks before replacing the previous copy.
 - **Every write is checked first and read back after.** Each write requires
   the current value and a range verified against Axe-Edit's own firmware
   definitions. Model selection and list parameters are refused.
+- **Effect bypass uses the native toggle on the verified 1.15.03 build.**
+  Both the bypass button and grid block must report the requested state.
+  Other builds report bypass unavailable; the assistant does not fall back
+  to an accessibility press that may be accepted without changing the effect.
 - **Chat stays local.** It goes only to your local CLI's normal service.
   History is kept in `~/Library/Application Support/AxeStudioEmbeddedChat/`.
 

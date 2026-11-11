@@ -32,6 +32,22 @@ int main(void) {
         assert([renderFencedMarkdown(@"````\n```\n````", body).string isEqual:@"```\n"]);
         puts("PASS: fenced code styling, indentation, matching fences and unfinished streaming blocks");
         AxeChatPanel *panel = [[AxeChatPanel alloc] initWithFrame:NSMakeRect(0, 0, 300, 852)];
+        [panel resizeSubviewsWithOldSize:NSZeroSize];
+        NSView *host = [[NSView alloc] initWithFrame:panel.frame];
+        [host addSubview:panel];
+        NSPoint placeholderPoint = [host convertPoint:NSMakePoint(NSMidX(panel.placeholder.frame), NSMidY(panel.placeholder.frame)) fromView:panel];
+        assert([panel hitTest:placeholderPoint] == panel.composer);
+        [panel.agent setValue:@YES forKey:@"busy"];
+        [panel refresh];
+        assert(panel.composer.editable && panel.composer.selectable);
+        [panel.composer insertText:@"Next tone request" replacementRange:NSMakeRange(0, 0)];
+        [panel sendMessage:nil];
+        assert([panel.composer.string isEqual:@"Next tone request"] && panel.agent.messages.count == 0);
+        [panel.agent setValue:@NO forKey:@"busy"];
+        [panel refresh];
+        assert(panel.composer.editable && panel.composer.selectable && [panel.composer.string isEqual:@"Next tone request"]);
+        panel.composer.string = @""; [panel updateActionAvailability];
+        puts("PASS: placeholder clicks reach composer; drafting stays enabled and unsent while busy");
         for (NSNumber *height in @[@852, @550, @300, @852]) {
             panel.frame = NSMakeRect(0, 0, 300, height.doubleValue);
             [panel resizeSubviewsWithOldSize:NSZeroSize];

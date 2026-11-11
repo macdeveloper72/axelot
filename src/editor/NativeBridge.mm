@@ -370,4 +370,38 @@ static uintptr_t knobForNode(id node) {
     gMethod((void *)(uintptr_t)[info[@"_comm"] unsignedLongLongValue],&record,0,(void *)(uintptr_t)[info[@"_undo"] unsignedLongLongValue]);
     return YES;
 }
+- (BOOL)nativeBypassAvailable { return self.available && _profile.verified; }
+- (BOOL)setBypassed:(BOOL)bypassed forAccessibilityNode:(id)node failure:(NSString **)failure {
+    auto fail=[&](NSString *why)->BOOL {if(failure)*failure=why;return NO;};
+    if(!NSThread.isMainThread) return fail(@"Native editor access must run on the main thread");
+    if(!self.nativeBypassAvailable) return fail(@"Native bypass toggle is verified only for Axe-Edit 1.15.03; not sent");
+    if(![[node accessibilityRole] isEqual:NSAccessibilityButtonRole] || ![node isAccessibilityEnabled])
+        return fail(@"Bypass button is unavailable; not sent");
+    NSString *label=[node accessibilityLabel];
+    if(!label.length) label=[node accessibilityTitle];
+    if(!([label isEqual:@"Bypass"] || [label hasPrefix:@"Bypass:"]))
+        return fail(@"Control is not the effect bypass button; not sent");
+    Ivar ivar=class_getInstanceVariable([node class],"handler");
+    uintptr_t handler=0;
+    if(!ivar || !safeRead((uintptr_t)(__bridge void *)node+ivar_getOffset(ivar),&handler,sizeof handler) ||
+       ![rttiName(handler) containsString:@"ButtonAccessibilityHandler"])
+        return fail(@"Native bypass accessibility handler is not verified; not sent");
+    uintptr_t button=readPointer(handler+8);
+    if(![rttiName(button) isEqual:@"15A3PaintedButton"])
+        return fail(@"Native bypass button type is not verified; not sent");
+    NSString *value=[node accessibilityValue];
+    if(![value isKindOfClass:NSString.class] || !([value isEqual:@"On"] || [value isEqual:@"Off"]))
+        return fail(@"Bypass state is unreadable; not sent");
+    if([value isEqual:@"On"]==bypassed) return YES;
+    // A3PaintedButton::clicked reads the current Value and sends its INVERSE
+    // through the button's own A3ComponentComm callback. Pre-setting the UI
+    // toggle before notifying clicked would invert twice and send the original
+    // state. Dispatch clicked directly and let the editor update the UI from
+    // the actual result. Exact __text identity was checked by verify.
+    uintptr_t method=readPointer(readPointer(button)+0x188);
+    if(method!=slid(0x100325058)) return fail(@"Native bypass click handler is not verified; not sent");
+    using ClickMethod=void (*)(void *);
+    ((ClickMethod)method)((void *)button);
+    return YES;
+}
 @end

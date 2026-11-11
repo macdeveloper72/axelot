@@ -130,9 +130,9 @@ static NSString *parameterName(NSString *label) {
     add(@"axefx_inspect",@"Read the actual connected Axe-Edit UI: current Axe-Fx preset, eight scenes, grid blocks, selected block/channel, parameter values and observed ranges. Never invent missing values.",@{},@[]);
     NSDictionary *base=@{@"expected_context":context,@"operation_id":key};
     NSMutableDictionary *(^props)(NSDictionary*)=^NSMutableDictionary*(NSDictionary *extra) { NSMutableDictionary *p=[base mutableCopy];[p addEntriesFromDictionary:extra];return p; };
-    add(@"axefx_select_block",@"Select an existing effect by its inspected grid label. Returns the selected block's actual parameters; does not insert or remove blocks.",props(@{@"block":string}),@[@"block",@"expected_context",@"operation_id"]);
+    add(@"axefx_select_block",@"Select an existing effect. Supply all three required arguments: block = exact label from axefx_inspect.blocks, expected_context = latest inspection's context_token, operation_id = unique ID for this selection (preserve on retries). Returns the selected block's actual parameters; does not insert or remove blocks.",props(@{@"block":string}),@[@"block",@"expected_context",@"operation_id"]);
     add(@"axefx_set_parameter",@"Change one numeric knob of the selected effect through Axe-Edit's own Undo-aware parameter command (the same path as typing a value into the knob). Requires the exact current value as expected_value and a value within the inspected minimum..maximum. Only parameters inspected as writable=true can be set; not_writable_reason explains the rest. Returns editor readback; the user can undo with Cmd-Z; hardware persistence is not claimed.",props(@{@"parameter":string,@"value":number,@"expected_value":number}),@[@"parameter",@"value",@"expected_value",@"expected_context",@"operation_id"]);
-    add(@"axefx_set_bypass",@"Set the selected effect's bypass state in the current scene; verify the returned UI state.",props(@{@"bypassed":@{@"type":@"boolean"}}),@[@"bypassed",@"expected_context",@"operation_id"]);
+    add(@"axefx_set_bypass",@"Set the selected effect's bypass state in the current scene through the native toggle (verified Axe-Edit 1.15.03 only). Inspect capabilities.effect_bypass first. Success requires both button and grid readback.",props(@{@"bypassed":@{@"type":@"boolean"}}),@[@"bypassed",@"expected_context",@"operation_id"]);
     add(@"axefx_select_channel",@"Choose an existing channel A-D for the selected effect in the current scene. Other scenes/channels are not rewritten.",props(@{@"channel":@{@"type":@"string",@"enum":@[@"A",@"B",@"C",@"D"]}}),@[@"channel",@"expected_context",@"operation_id"]);
     add(@"axefx_select_scene",@"Select one of the Axe-Fx's eight existing scene slots (1-8). Build a scene by selecting it, setting block bypass/channels/parameters, and naming it. There are no extra scene slots.",props(@{@"scene":@{@"type":@"integer",@"minimum":@1,@"maximum":@8}}),@[@"scene",@"expected_context",@"operation_id"]);
     add(@"axefx_name_scene",@"Rename the current scene using Axe-Edit's editable scene-name control; changes the edit buffer, never stores the preset.",props(@{@"name":@{@"type":@"string",@"minLength":@1,@"maxLength":@32}}),@[@"name",@"expected_context",@"operation_id"]);
@@ -199,10 +199,11 @@ static NSString *parameterName(NSString *label) {
     NSData *encoded=[NSJSONSerialization dataWithJSONObject:context options:NSJSONWritingSortedKeys error:nil];
     NSString *token=[[NSString alloc] initWithData:encoded encoding:NSUTF8StringEncoding] ?: @"{}";
     connected=connected && context[@"Preset Number"] && context[@"Scene Number"];
+    BOOL bypassAvailable=connected && [self.writer respondsToSelector:@selector(nativeBypassAvailable)] && [self.writer nativeBypassAvailable];
     return @{@"ok":@YES,@"connected":@(connected),@"context":context,@"context_token":token,
         @"blocks":blocks,@"scenes":scenes,@"parameters":parameters,
         @"verification_scope":@"axe_edit_ui",@"hardware_persistence_verified":@NO,
-        @"capabilities":@{@"parameter_edit":@(connected),@"effect_bypass_and_channels":@(connected),@"scene_configuration":@(connected),
+        @"capabilities":@{@"parameter_edit":@(connected),@"effect_bypass_and_channels":@(bypassAvailable),@"effect_bypass":@(bypassAvailable),@"effect_channels":@(connected),@"scene_configuration":@(connected),
             @"effect_model_selection":@NO,@"block_insertion":@NO,@"block_deletion":@NO,@"routing_edits":@NO,@"preset_store":@NO}};
 }
 - (void)call:(NSString *)name arguments:(NSDictionary *)args authority:(AxeToolAuthority)authority reply:(AxeToolReply)reply {
@@ -212,7 +213,14 @@ static NSString *parameterName(NSString *label) {
     if(!definition || ![args isKindOfClass:NSDictionary.class]) {reply(errorResult(@"Unknown tool or invalid arguments"));return;}
     NSDictionary *properties=definition[@"inputSchema"][@"properties"];
     for(NSString *field in args)if(!properties[field]) {reply(errorResult(@"Unexpected tool argument"));return;}
-    for(NSString *field in definition[@"inputSchema"][@"required"])if(!args[field] || args[field]==NSNull.null) {reply(errorResult(@"A required tool argument is missing"));return;}
+    NSMutableArray *missing=[NSMutableArray array];
+    for(NSString *field in definition[@"inputSchema"][@"required"])
+        if(!args[field] || args[field]==NSNull.null) [missing addObject:field];
+    if(missing.count) {
+        reply(@{@"ok":@NO,@"error":[NSString stringWithFormat:@"%@: missing required arguments: %@. No editor action was performed. Supply every required argument from the tool schema.",name,[missing componentsJoinedByString:@", "]],
+            @"code":@"missing_required_arguments",@"missing_arguments":missing,@"required_arguments":definition[@"inputSchema"][@"required"],@"action_performed":@NO});
+        return;
+    }
     if([name isEqual:@"axefx_inspect"]) { reply([self inspect]); return; }
     // Audio tools are read-only analysis of local clips: no editor context needed.
     if([name hasPrefix:@"axefx_audio_"]) { [AxeAudioTools call:name arguments:args clips:self.audioClips ?: [AxeAudioClips shared] reply:reply]; return; }
@@ -259,7 +267,17 @@ static NSString *parameterName(NSString *label) {
         }
         if(label) target=[self find:NSAccessibilityButtonRole label:label nodes:nodes];
         NSNumber *current=boolOf(attr(target,@"value"));
-        accepted=target && current && ([current boolValue]==[wanted boolValue] || press(target));verifyKind=@"button";
+        if([name isEqual:@"axefx_set_bypass"]) {
+            NSString *block=before[@"context"][@"block"];
+            if(!([block hasSuffix:@", Active"] || [block hasSuffix:@", Bypassed"]))
+                failure=@"Selected block has no observed bypass state; not sent";
+            else if(![self.writer respondsToSelector:@selector(setBypassed:forAccessibilityNode:failure:)])
+                failure=@"Native bypass toggle is unavailable; not sent";
+            else if(target && current) accepted=[self.writer setBypassed:[wanted boolValue] forAccessibilityNode:target failure:&failure];
+            verifyKind=@"bypass";
+        } else {
+            accepted=target && current && ([current boolValue]==[wanted boolValue] || press(target));verifyKind=@"button";
+        }
         wanted=@{@"label":label ?: @"",@"value":wanted ?: NSNull.null};
     } else if([name isEqual:@"axefx_name_scene"]) {
         NSString *value=args[@"name"];
@@ -280,10 +298,12 @@ static NSString *parameterName(NSString *label) {
         if([verifyKind isEqual:@"parameter"]) for(NSDictionary *parameter in after[@"parameters"])
             if([parameter[@"parameter"] isEqual:wanted[@"parameter"]] && [parameter[@"value"] isKindOfClass:NSNumber.class])
                 verified=std::abs([parameter[@"value"] doubleValue]-[wanted[@"value"] doubleValue])<=displayTolerance(parameter[@"label"]);
-        if([verifyKind isEqual:@"button"]) {
+        if([verifyKind isEqual:@"button"] || [verifyKind isEqual:@"bypass"]) {
             id fresh=[self find:NSAccessibilityButtonRole label:wanted[@"label"] nodes:[self nodes]];
             NSNumber *current=boolOf(attr(fresh,@"value"));
             verified=fresh && current && current.boolValue==[wanted[@"value"] boolValue];
+            if([verifyKind isEqual:@"bypass"])
+                verified=verified && [after[@"context"][@"block"] hasSuffix:([wanted[@"value"] boolValue] ? @", Bypassed" : @", Active")];
         }
         if([verifyKind isEqual:@"scene_name"]) verified=[after[@"context"][@"Scene Name"] isEqual:wanted];
         NSMutableArray *stableFields=[NSMutableArray arrayWithArray:@[@"Preset Number",@"Preset Name"]];

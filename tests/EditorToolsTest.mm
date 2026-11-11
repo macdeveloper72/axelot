@@ -15,6 +15,7 @@
 @property(nonatomic,weak) id focused;
 @property(nonatomic,weak) NSWindow *accessWindow;
 @property(nonatomic) NSUInteger writes;
+@property(nonatomic) NSUInteger presses;
 @property(nonatomic,copy) void (^action)(void);
 @end
 @implementation TestAX
@@ -30,7 +31,7 @@
 - (NSWindow *)accessibilityWindow{return self.accessWindow;}
 - (BOOL)isAccessibilitySelectorAllowed:(SEL)selector{return selector==@selector(setAccessibilityValue:) ? self.writable : (selector==@selector(accessibilityPerformPress) ? self.action!=nil : YES);}
 - (void)setAccessibilityValue:(id)value{assert([value isKindOfClass:NSString.class]);self.writes++;self.value=value;}
-- (BOOL)accessibilityPerformPress{if(self.action)self.action();return self.action!=nil;}
+- (BOOL)accessibilityPerformPress{self.presses++;if(self.action)self.action();return self.action!=nil;}
 @end
 
 // Stands in for AxeNativeBridge: knobs it knows are writable within 0..10;
@@ -39,8 +40,11 @@
 @property(nonatomic,strong) NSHashTable *knobs;
 @property(nonatomic) NSUInteger writes;
 @property(nonatomic) BOOL dropNextWrite;
+@property(nonatomic) NSUInteger bypassWrites;
+@property(nonatomic) BOOL refuseBypass;
 @end
 @implementation FakeWriter
+- (BOOL)nativeBypassAvailable { return !self.refuseBypass; }
 - (NSDictionary *)parameterForAccessibilityNode:(id)node failure:(NSString **)failure {
     if(![self.knobs containsObject:node]) {if(failure)*failure=@"Control is not an Axe-Edit rotary knob";return nil;}
     return @{@"effect":@58,@"parameter":@1,@"display_min":@0,@"display_max":@10,@"scale":@10,@"step":@0.001};
@@ -51,6 +55,12 @@
     self.writes++;
     if(self.dropNextWrite) {self.dropNextWrite=NO;return YES;}
     ((TestAX *)node).value=[NSString stringWithFormat:@"%.2f",value];
+    return YES;
+}
+- (BOOL)setBypassed:(BOOL)bypassed forAccessibilityNode:(id)node failure:(NSString **)failure {
+    if(self.refuseBypass) {if(failure)*failure=@"Native bypass unavailable";return NO;}
+    self.bypassWrites++;
+    if([((TestAX *)node).value boolValue]!=bypassed && ((TestAX *)node).action) ((TestAX *)node).action();
     return YES;
 }
 @end
@@ -78,11 +88,28 @@ int main(void){@autoreleasepool{
     TestAX *bypass=node(NSAccessibilityButtonRole,@"Bypass",@NO);
     __weak TestAX *weakBypass=bypass;bypass.action=^{weakBypass.value=@(![weakBypass.value boolValue]);};
     root.children=@[connection,preset,scene,sceneName,block,gain,bass,bypass];
+    // Incomplete selections identify each missing field and never press a block.
+    __block NSUInteger presses=0;block.action=^{presses++;};
+    NSDictionary *selection=@{@"block":block.title,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"select-1"};
+    for(NSString *field in @[@"block",@"expected_context",@"operation_id"]) {
+        for(NSNumber *useNull in @[@NO,@YES]) {
+            NSMutableDictionary *incomplete=[selection mutableCopy];
+            if(useNull.boolValue) incomplete[field]=NSNull.null;else [incomplete removeObjectForKey:field];
+            NSDictionary *rejected=call(tools,@"axefx_select_block",incomplete,^BOOL{return YES;},nil);
+            assert(![rejected[@"ok"] boolValue] && [rejected[@"code"] isEqual:@"missing_required_arguments"]);
+            assert([rejected[@"missing_arguments"] isEqual:@[field]] && [rejected[@"error"] containsString:field]);
+            assert([rejected[@"action_performed"] isEqual:@NO] && presses==0);
+        }
+    }
+    NSDictionary *emptySelection=call(tools,@"axefx_select_block",@{},^BOOL{return YES;},nil);
+    assert(([emptySelection[@"missing_arguments"] isEqual:@[@"block",@"expected_context",@"operation_id"]] && presses==0));
     // Without a verified Axe-Edit executable the real bridge refuses every knob.
     NSDictionary *snapshot=[tools inspect];assert([snapshot[@"connected"] boolValue]);assert([snapshot[@"parameters"] count]==2);
     assert(![snapshot[@"parameters"][0][@"writable"] boolValue] && [snapshot[@"parameters"][0][@"not_writable_reason"] length]);
     assert(![AxeNativeBridge shared].available);
+    assert(![snapshot[@"capabilities"][@"effect_bypass"] boolValue]);
     NSString *refused=nil;assert(![[AxeNativeBridge shared] setDisplayValue:2.61 forAccessibilityNode:gain failure:&refused] && refused.length);
+    assert(![[AxeNativeBridge shared] setBypassed:YES forAccessibilityNode:bypass failure:&refused]);
     // Conversion: knob range must equal cache range x scale; raw = display/scale.
     float raw=0;NSString *why=nil;
     assert(AxeNativeDisplayToRaw(2.61,0,1,10,0,10,&raw,&why) && std::fabs(raw-0.261f)<1e-6);
@@ -131,9 +158,24 @@ int main(void){@autoreleasepool{
     result=call(tools,@"axefx_name_scene",rename,^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && [sceneName.value isEqual:@"Lead"]);
     NSDictionary *fraction=@{@"scene":@1.5,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"fractional-scene"};
     result=call(tools,@"axefx_select_scene",fraction,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue]);
-    // Bypass readback must compare grid identity, not its changing state suffix.
+    // The real AX press reported acceptance without changing bypass. Native
+    // toggle must be used, and its checkmark alone cannot prove effect bypass.
+    bypass.action=^{weakBypass.value=@YES;};
+    NSDictionary *bypassArgs=@{@"bypassed":@YES,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"bypass-grid-unchanged"};
+    result=call(tools,@"axefx_set_bypass",bypassArgs,^BOOL{return YES;},nil);
+    assert(![result[@"ok"] boolValue] && [result[@"status"] isEqual:@"sent_readback_unverified"] && writer.bypassWrites==1);
+    result=call(tools,@"axefx_set_bypass",bypassArgs,^BOOL{return YES;},nil);
+    assert(![result[@"ok"] boolValue] && writer.bypassWrites==1);
+    bypass.value=@NO;writer.refuseBypass=YES;
+    assert(![[tools inspect][@"capabilities"][@"effect_bypass"] boolValue]);
+    result=call(tools,@"axefx_set_bypass",@{@"bypassed":@YES,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"bypass-refused"},^BOOL{return YES;},nil);
+    assert(![result[@"ok"] boolValue] && writer.bypassWrites==1 && ![bypass.value boolValue]);
+    writer.refuseBypass=NO;
+    assert([[tools inspect][@"capabilities"][@"effect_bypass"] boolValue]);
+    // Bypass readback compares grid identity and the changed state suffix.
     bypass.action=^{weakBypass.value=@(![weakBypass.value boolValue]);block.title=@"Grid row 2 column 3: Amp 1A, Bypassed";};
     result=call(tools,@"axefx_set_bypass",@{@"bypassed":@YES,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"bypass-on"},^BOOL{return YES;},nil);assert([result[@"ok"] boolValue]);
+    assert(writer.bypassWrites==2 && bypass.presses==0);
     TestAX *a=node(NSAccessibilityButtonRole,@"Channel A",@YES),*b=node(NSAccessibilityButtonRole,@"Channel B",@NO);
     __weak TestAX *weakA=a,*weakB=b;b.action=^{weakA.value=@NO;weakB.value=@YES;block.title=@"Grid row 2 column 3: Amp 1B, Bypassed";};
     root.children=[root.children arrayByAddingObjectsFromArray:@[a,b]];

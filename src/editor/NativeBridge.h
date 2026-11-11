@@ -15,6 +15,7 @@
 /// YES when the executable's __text matches the active profile's identity
 /// and the profile's RTTI and vtable slots check out in memory.
 @property(nonatomic, readonly) BOOL available;
+@property(nonatomic, readonly) BOOL nativeBypassAvailable;
 @property(nonatomic, readonly, copy) NSString *unavailableReason;
 /// "verified-1.15.03", "discovered" or nil (unavailable).
 @property(nonatomic, readonly, copy) NSString *profileKind;
@@ -36,6 +37,9 @@
 /// (op 0x09, flag 0), exactly like a typed knob entry. Main thread only.
 - (BOOL)setDisplayValue:(double)value forAccessibilityNode:(id)node
                 failure:(NSString **)failure;
+/// Native Button::setToggleState with editor notifications. Verified 1.15.03
+/// only; unsupported builds refuse rather than using the ineffective AX press.
+- (BOOL)setBypassed:(BOOL)bypassed forAccessibilityNode:(id)node failure:(NSString **)failure;
 @end
 
 /// Pure conversion used by the bridge (exposed for unit tests).

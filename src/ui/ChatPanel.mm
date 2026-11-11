@@ -11,6 +11,13 @@ static const CGFloat kComposerMin = 44, kComposerMax = 120, kActionSize = 26;
 static NSColor *panelBackground(void) { return [NSColor colorWithWhite:0.125 alpha:1]; }
 static NSColor *fieldBackground(void) { return [NSColor colorWithWhite:0.095 alpha:1]; }
 
+// The placeholder overlays the composer; clicks must reach the text view.
+@interface AxeChatPlaceholder : NSTextField
+@end
+@implementation AxeChatPlaceholder
+- (NSView *)hitTest:(NSPoint)point { return nil; }
+@end
+
 static NSTextField *label(NSString *text, CGFloat size, NSColor *color) {
     NSTextField *field = [NSTextField labelWithString:text];
     field.font = [NSFont systemFontOfSize:size];
@@ -173,7 +180,9 @@ static NSAttributedString *renderFencedMarkdown(NSString *text, NSDictionary *bo
         _composer.delegate = self;
         _composer.accessibilityLabel = @"Message to local agent";
         styleScroll(_composerScroll, _composer, fieldBackground(), NSMakeSize(4, 7));
-        _placeholder = label(@"Describe a tone or scene…", 13, NSColor.placeholderTextColor);
+        _placeholder = [AxeChatPlaceholder labelWithString:@"Describe a tone or scene…"];
+        _placeholder.font = [NSFont systemFontOfSize:13];
+        _placeholder.textColor = NSColor.placeholderTextColor;
         _actionButton = [NSButton buttonWithImage:symbol(@"arrow.up.circle.fill", 20) target:self action:@selector(sendOrStop:)];
         _actionButton.bordered = NO;
         _actionButton.imagePosition = NSImageOnly;
@@ -314,7 +323,10 @@ static NSAttributedString *renderFencedMarkdown(NSString *text, NSDictionary *bo
     if (busy) [self.spinner startAnimation:nil]; else [self.spinner stopAnimation:nil];
     self.statusLabel.stringValue = self.agent.status ?: @"";
     self.statusLabel.toolTip = self.agent.status;
-    self.composer.editable = !busy;
+    // Keep drafting and selection available while a reply is running.
+    // sendMessage still refuses submission until the agent is ready and idle.
+    self.composer.editable = YES;
+    self.composer.selectable = YES;
     self.actionButton.image = symbol(busy ? @"stop.circle.fill" : @"arrow.up.circle.fill", 20);
     self.actionButton.contentTintColor = busy ? NSColor.systemRedColor : NSColor.controlAccentColor;
     self.actionButton.accessibilityLabel = busy ? @"Stop" : @"Send";
