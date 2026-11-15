@@ -6,6 +6,14 @@
 int main(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
+        NSWindow *startEditor=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,800,600) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:YES];
+        assert(!editorIsInitializing(startEditor));
+        NSWindow *startOverlay=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,200,100) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:YES];
+        [startEditor orderFront:nil];[startEditor addChildWindow:startOverlay ordered:NSWindowAbove];[startOverlay orderFront:nil];
+        assert(editorIsInitializing(startEditor));
+        [startEditor removeChildWindow:startOverlay];[startOverlay orderOut:nil];
+        assert(!editorIsInitializing(startEditor));[startEditor orderOut:nil];
+        puts("PASS: sidebar waits for a native startup child window and attaches after it closes");
         NSRect screen = NSMakeRect(0, 0, 2000, 1200);
         // Pure geometry: flush right, same height/origin; left when no room.
         for (CGFloat x = 0; x <= 1600; x += 100) {

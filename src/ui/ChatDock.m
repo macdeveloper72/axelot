@@ -156,11 +156,30 @@ static AxeChatDock *dock;
 
 static NSRect lastEditorFrame;
 
+// Do not attach while Axe-Edit shows a modal/sheet/child window during
+// startup. Only cheap AppKit state is checked: walking JUCE's accessibility
+// tree here forces handler creation and stalled the editor's initialization.
+static BOOL editorIsInitializing(NSWindow *window) {
+    if(NSApp.modalWindow!=nil || window.attachedSheet!=nil)return YES;
+    for(NSWindow *child in window.childWindows)
+        if(child.visible && child!=(NSWindow *)dock.panel)return YES;
+    return NO;
+}
+static BOOL waitingForInitialization;
+
 static BOOL attach(void) {
     for (NSWindow *window in NSApp.windows) {
         if (![window.title containsString:@"Axe-Edit III"] || !window.visible ||
             window.contentView.bounds.size.width < 100 || [window isKindOfClass:NSPanel.class]) continue;
         if (dock.editorWindow == window) return YES;
+        BOOL initializing=editorIsInitializing(window);
+        if(initializing) {
+            if(!waitingForInitialization)record(@"waiting for native editor initialization before attaching chat panel");
+            waitingForInitialization=YES;
+            return NO;
+        }
+        if(waitingForInitialization)record(@"native editor initialization finished; attaching chat panel");
+        waitingForInitialization=NO;
         // JUCE places and sizes its window in steps at launch; attaching
         // before it settles leaves the panel beside a stale frame. Wait
         // until the frame is the same on two consecutive ticks.
@@ -197,8 +216,8 @@ __attribute__((constructor)) static void initialize(void) {
         record(@"library loaded");
         __block NSInteger attempts = 0;
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
-            if (attach() || ++attempts >= 60) {
-                if (attempts >= 60) record(@"attachment timed out");
+            if (attach() || ++attempts >= 240) {
+                if (attempts >= 240) record(@"attachment timed out");
                 [timer invalidate];
             }
         }];

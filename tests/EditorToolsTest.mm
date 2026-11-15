@@ -42,8 +42,30 @@
 @property(nonatomic) BOOL dropNextWrite;
 @property(nonatomic) NSUInteger bypassWrites;
 @property(nonatomic) BOOL refuseBypass;
+@property(nonatomic,strong) NSArray *routing;
+@property(nonatomic) NSUInteger cableWrites;
+@property(nonatomic) BOOL dropCableWrite;
+@property(nonatomic) BOOL extraCable;
+@property(nonatomic) double cableDelay;
 @end
 @implementation FakeWriter
+- (NSArray *)routingForGridNode:(id)node failure:(NSString **)failure {return self.routing;}
+- (BOOL)setCableFromNode:(id)source toNode:(id)destination connected:(BOOL)connected failure:(NSString **)failure {
+    self.cableWrites++;
+    if(self.dropCableWrite)return YES;
+    int sr,sc,dr,dc;sscanf([((TestAX *)source).title UTF8String],"Grid row %d column %d:",&sr,&sc);sscanf([((TestAX *)destination).title UTF8String],"Grid row %d column %d:",&dr,&dc);
+    NSDictionary *edge=@{@"source_row":@(sr),@"source_column":@(sc),@"destination_row":@(dr),@"destination_column":@(dc)};
+    NSMutableArray *edges=[self.routing mutableCopy];if(connected)[edges addObject:edge];else [edges removeObject:edge];
+    if(self.extraCable)[edges addObject:@{@"source_row":@0,@"source_column":@10,@"destination_row":@0,@"destination_column":@11}];
+    if(self.cableDelay>0) {
+        // Axe-Edit reloads its grid after a device round-trip: readback is
+        // unavailable first, then shows the change.
+        self.routing=nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(self.cableDelay*NSEC_PER_SEC)),dispatch_get_main_queue(),^{self.routing=edges;});
+        return YES;
+    }
+    self.routing=edges;return YES;
+}
 - (BOOL)nativeBypassAvailable { return !self.refuseBypass; }
 - (NSDictionary *)parameterForAccessibilityNode:(id)node failure:(NSString **)failure {
     if(![self.knobs containsObject:node]) {if(failure)*failure=@"Control is not an Axe-Edit rotary knob";return nil;}
@@ -70,7 +92,7 @@ static NSDictionary *call(AxeEditorTools *tools,NSString *name,NSDictionary *arg
     __block NSDictionary *result=nil;
     [tools call:name arguments:args authority:alive reply:^(NSDictionary *value){result=value;}];
     if(afterSend)afterSend();
-    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:2];
+    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:6];
     while(!result && deadline.timeIntervalSinceNow>0)[NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     assert(result);return result;
 }
@@ -103,6 +125,29 @@ int main(void){@autoreleasepool{
     }
     NSDictionary *emptySelection=call(tools,@"axefx_select_block",@{},^BOOL{return YES;},nil);
     assert(([emptySelection[@"missing_arguments"] isEqual:@[@"block",@"expected_context",@"operation_id"]] && presses==0));
+    // Grid topology participates in stale-context protection, including empty cells.
+    NSString *oldGridContext=[tools inspect][@"context_token"];
+    TestAX *emptyCell=node(NSAccessibilityRadioButtonRole,@"Grid row 1 column 1: Empty",@NO);
+    root.children=[root.children arrayByAddingObject:emptyCell];
+    assert(![[tools inspect][@"context_token"] isEqual:oldGridContext]);
+    NSDictionary *staleGrid=call(tools,@"axefx_remove_block",@{@"expected_context":oldGridContext,@"operation_id":@"stale-grid"},^BOOL{return YES;},nil);
+    assert(![staleGrid[@"ok"] boolValue] && [staleGrid[@"error"] containsString:@"Stale"]);
+    NSDictionary *unsupportedGrid=call(tools,@"axefx_add_block",@{@"effect_id":@58,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"unsupported-grid"},^BOOL{return YES;},nil);
+    assert(![unsupportedGrid[@"ok"] boolValue]);
+    // Effect catalog lets the agent insert by type name instead of guessing IDs.
+    NSDictionary *catalogInspect=[tools inspect];
+    BOOL sawDrive=NO;for(NSDictionary *t in catalogInspect[@"effect_catalog"])if([t[@"type"] isEqual:@"Drive"]){sawDrive=YES;assert([t[@"available_instances"] isEqual:(@[@118,@119,@120,@121])]);}
+    assert(sawDrive);
+    NSDictionary *addSpec=nil;for(NSDictionary *spec in [AxeEditorTools specifications])if([spec[@"name"] isEqual:@"axefx_add_block"])addSpec=spec;
+    assert([addSpec[@"inputSchema"][@"properties"][@"effect_type"][@"enum"] containsObject:@"Amp"]);
+    assert(addSpec[@"inputSchema"][@"properties"][@"expected_context"]);
+    NSDictionary *unknownType=call(tools,@"axefx_add_block",@{@"effect_type":@"Kazoo",@"expected_context":catalogInspect[@"context_token"],@"operation_id":@"unknown-type"},^BOOL{return YES;},nil);
+    assert(![unknownType[@"ok"] boolValue]);
+    NSDictionary *mismatch=call(tools,@"axefx_add_block",@{@"effect_type":@"Drive",@"effect_id":@58,@"expected_context":catalogInspect[@"context_token"],@"operation_id":@"type-mismatch"},^BOOL{return YES;},nil);
+    assert(![mismatch[@"ok"] boolValue]);
+    NSDictionary *neither=call(tools,@"axefx_add_block",@{@"expected_context":catalogInspect[@"context_token"],@"operation_id":@"no-effect"},^BOOL{return YES;},nil);
+    assert(![neither[@"ok"] boolValue]);
+    root.children=[root.children subarrayWithRange:NSMakeRange(0,root.children.count-1)];
     // Without a verified Axe-Edit executable the real bridge refuses every knob.
     NSDictionary *snapshot=[tools inspect];assert([snapshot[@"connected"] boolValue]);assert([snapshot[@"parameters"] count]==2);
     assert(![snapshot[@"parameters"][0][@"writable"] boolValue] && [snapshot[@"parameters"][0][@"not_writable_reason"] length]);
@@ -185,5 +230,57 @@ int main(void){@autoreleasepool{
     result=call(tools,@"axefx_select_scene",@{@"scene":@2,@"expected_context":[tools inspect][@"context_token"],@"operation_id":@"scene-2"},^BOOL{return YES;},nil);assert([result[@"ok"] boolValue]);
     connection.value=@"Disconnected!";bad[@"operation_id"]=@"disconnected";
     NSUInteger writes=writer.writes;result=call(tools,@"axefx_set_parameter",bad,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.writes==writes);
-    puts("PASS: native-bridge fail-closed outside Axe-Edit, display/raw conversion guard, writer-gated writability and ranges, expected value, readback precision, mismatch restore, scene naming without typing, stale context, Stop revocation, disconnect and idempotent retries (authored fixtures only)");
+    connection.value=@"Connected!";
+    // Cable operations verify exact endpoints and the complete routing graph.
+    TestAX *cab=node(NSAccessibilityRadioButtonRole,@"Grid row 3 column 4: Cab 1A, Active",@NO);
+    TestAX *gap=node(NSAccessibilityRadioButtonRole,@"Grid row 3 column 6: Delay 1A, Active",@NO);
+    root.children=[root.children arrayByAddingObjectsFromArray:@[cab,gap]];writer.routing=@[];
+    NSDictionary *(^cableArgs)(NSString *)=^NSDictionary *(NSString *key){return @{@"source":block.title,@"destination":cab.title,@"expected_context":[tools inspect][@"context_token"],@"operation_id":key};};
+    assert([[tools inspect][@"capabilities"][@"routing_edits"] boolValue]);
+    NSDictionary *connectArgs=cableArgs(@"connect-cable");
+    result=call(tools,@"axefx_connect_blocks",connectArgs,^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && writer.cableWrites==1 && writer.routing.count==1);
+    result=call(tools,@"axefx_connect_blocks",connectArgs,^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && writer.cableWrites==1);
+    result=call(tools,@"axefx_connect_blocks",cableArgs(@"connect-noop"),^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && writer.cableWrites==1);
+    NSMutableDictionary *badCable=[cableArgs(@"cable-gap") mutableCopy];badCable[@"destination"]=gap.title;
+    result=call(tools,@"axefx_connect_blocks",badCable,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==1);
+    NSDictionary *staleCable=cableArgs(@"cable-stale");writer.routing=@[];
+    result=call(tools,@"axefx_disconnect_blocks",staleCable,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==1);
+    writer.dropCableWrite=YES;NSDictionary *uncertain=cableArgs(@"cable-dropped");
+    result=call(tools,@"axefx_connect_blocks",uncertain,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==2);
+    result=call(tools,@"axefx_connect_blocks",uncertain,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==2);
+    writer.dropCableWrite=NO;writer.extraCable=YES;
+    result=call(tools,@"axefx_connect_blocks",cableArgs(@"cable-unrelated"),^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==3);
+    writer.extraCable=NO;
+    result=call(tools,@"axefx_disconnect_blocks",cableArgs(@"cable-remove"),^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && writer.cableWrites==4 && writer.routing.count==1);
+    result=call(tools,@"axefx_disconnect_blocks",cableArgs(@"cable-remove-noop"),^BOOL{return YES;},nil);assert([result[@"ok"] boolValue] && writer.cableWrites==4);
+    __block BOOL cableAuthority=YES;NSDictionary *stoppedCable=cableArgs(@"cable-stop");
+    result=call(tools,@"axefx_connect_blocks",stoppedCable,^BOOL{return cableAuthority;},^{cableAuthority=NO;});
+    assert(![result[@"ok"] boolValue] && [result[@"status"] isEqual:@"stopped_after_send"] && writer.cableWrites==5);
+    cableAuthority=YES;
+    result=call(tools,@"axefx_connect_blocks",stoppedCable,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==5);
+    NSDictionary *switchCable=cableArgs(@"cable-preset-switch");
+    NSString *originalPreset=preset.value;
+    result=call(tools,@"axefx_disconnect_blocks",switchCable,^BOOL{return YES;},^{preset.value=@"446";});
+    assert(![result[@"ok"] boolValue] && writer.cableWrites==6);
+    preset.value=originalPreset;
+    result=call(tools,@"axefx_disconnect_blocks",switchCable,^BOOL{return YES;},nil);assert(![result[@"ok"] boolValue] && writer.cableWrites==6);
+    // A slow grid reload is polled until it settles instead of reported unverified.
+    writer.routing=@[];writer.cableDelay=1.0;
+    result=call(tools,@"axefx_connect_blocks",cableArgs(@"cable-slow-reload"),^BOOL{return YES;},nil);
+    assert([result[@"ok"] boolValue] && [result[@"status"] isEqual:@"ui_readback_verified"] && writer.cableWrites==7 && writer.routing.count==1);
+    writer.cableDelay=0;
+    // A write that never shows up reports unverified with guidance, after polling.
+    writer.dropCableWrite=YES;
+    result=call(tools,@"axefx_disconnect_blocks",cableArgs(@"cable-never"),^BOOL{return YES;},nil);
+    assert(![result[@"ok"] boolValue] && [result[@"status"] isEqual:@"sent_readback_unverified"] && [result[@"next_step"] containsString:@"axefx_inspect"]);
+    writer.dropCableWrite=NO;
+    // I/O blocks are insertable by name; tone-building guidance is in the prompt.
+    BOOL sawInput=NO,sawOutput=NO;
+    for(NSDictionary *t in [tools inspect][@"effect_catalog"]) {
+        if([t[@"type"] isEqual:@"Input"]){sawInput=YES;assert([t[@"available_instances"] containsObject:@37] && ![t[@"id_mapping_verified"] boolValue]);}
+        if([t[@"type"] isEqual:@"Output"]){sawOutput=YES;assert([t[@"available_instances"] containsObject:@42]);}
+    }
+    assert(sawInput && sawOutput);
+    assert([[AxeEditorTools systemPrompt] containsString:@"Building a tone from scratch"]);
+    puts("PASS: native-bridge fail-closed outside Axe-Edit, display/raw conversion guard, writer-gated writability and ranges, expected value, readback precision, mismatch restore, scene naming without typing, stale context, Stop revocation, disconnect, cable endpoints/graph readback and idempotent retries (authored fixtures only)");
 }return 0;}

@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <set>
+#include <pthread.h>
 
 static const uint32_t kOpNumericWrite = 0x0009;
 static NSString *const kEnabledPrefix = @"AxeBridgeWritesEnabled.";
@@ -46,6 +47,10 @@ static Profile builtInProfile() {
 // from the executable's ID_* symbol tables and its type-name registry
 // (name/ID pairs: 7 Compressor ... 60 NAM Player). These are firmware IDs,
 // stable across editor builds.
+// Single-instance Input 1-4 / Output 1-4 (Fractal 3rd-party IDs 37-40, 42-45)
+// mapped to cache types 46-49 / 41-44; candidate mapping, confirmed by readback.
+static const struct { uint16_t id; uint32_t type; } kSingleInstanceTypes[] = {
+    {37,46},{38,47},{39,48},{40,49},{42,41},{43,42},{44,43},{45,44}};
 static const struct { uint16_t first; uint32_t type; } kInstanceTypes[] = {
     {46,7},{50,8},{54,9},{58,10},{62,11},{66,12},{70,13},{74,14},{78,16},{82,17},{86,18},
     {90,19},{94,20},{98,21},{102,40},{106,22},{110,23},{114,24},{118,25},{122,26},{126,28},
@@ -82,6 +87,11 @@ static NSString *rttiName(uintptr_t object) {
 static uint32_t cacheTypeForInstance(uint16_t effect) {
     for(auto &row:kInstanceTypes) if(effect>=row.first && effect<row.first+4) return row.type;
     return 0;
+}
+// Block insertion only: knob range lookup must not rely on the unconfirmed I/O mapping.
+static bool insertableInstance(uint16_t effect) {
+    for(auto &row:kSingleInstanceTypes) if(effect==row.id) return true;
+    return cacheTypeForInstance(effect)!=0;
 }
 static bool nearValue(double a, double b) { return std::fabs(a-b)<=1e-3*std::fmax(1.0,std::fmax(std::fabs(a),std::fabs(b))); }
 
@@ -226,6 +236,125 @@ long AxeFindUndoOffset(uintptr_t base, size_t limit) {
     self.available=YES; self.unavailableReason=nil; self.profileKind=kind;
     bridgeLog([NSString stringWithFormat:@"profile %@ method=0x%llx", kind, profile.method]);
 #endif
+}
+// Native grid commands recovered from the 1.15.04 arm64 dispatcher.
+- (BOOL)nativeBlockEditingAvailable {
+    static BOOL supported=NO; static dispatch_once_t once;
+    dispatch_once(&once, ^{supported=[self matchesBlockEditingBuild];});
+    return supported;
+}
+- (BOOL)matchesBlockEditingBuild {
+#if defined(__arm64__)
+    unsigned long size=0;
+    const struct mach_header_64 *header=nullptr;
+    for(uint32_t i=0;i<_dyld_image_count();++i) if(_dyld_get_image_header(i)->filetype==MH_EXECUTE) {
+        header=(const struct mach_header_64 *)_dyld_get_image_header(i); break;
+    }
+    uint8_t *bytes=header ? getsectiondata(header,"__TEXT","__text",&size) : nullptr;
+    if(!bytes)return NO;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(bytes,(CC_LONG)size,digest);
+    NSMutableString *hex=[NSMutableString string];for(unsigned i=0;i<sizeof digest;++i)[hex appendFormat:@"%02x",digest[i]];
+    return [hex isEqual:@"55c91db6d06c1d8df8249de58beac91bf760a6e55aefba92c98d60fc90e64818"];
+#else
+    return NO;
+#endif
+}
+// Resolve the actual grid model from an inspected cell; never retain pointers
+// across asynchronous operations or follow an unverified command target.
+- (uintptr_t)gridEditorForNode:(id)node failure:(NSString **)failure {
+    auto fail=[&](NSString *why)->uintptr_t {if(failure)*failure=why;return 0;};
+    if(!NSThread.isMainThread || !self.nativeBlockEditingAvailable)return fail(@"Routing requires Axe-Edit 1.15.04 arm64");
+    Ivar ivar=node ? class_getInstanceVariable([node class],"handler") : nullptr;uintptr_t handler=0;
+    if(!ivar || !safeRead((uintptr_t)(__bridge void *)node+ivar_getOffset(ivar),&handler,8))return fail(@"Grid accessibility handler unavailable");
+    uintptr_t block=readPointer(handler+8);
+    if(![rttiName(block) isEqual:@"16A3BlockComponent"] || unslide(readPointer(block))!=0x1013e9238)return fail(@"Grid component identity mismatch");
+    uintptr_t target=readPointer(block+0x388);
+    if(![rttiName(target) isEqual:@"17Gen3CommandTarget"] || unslide(readPointer(readPointer(target)+0x28))!=0x1000b6810)return fail(@"Grid command target mismatch");
+    uintptr_t grid=readPointer(target+0x80);
+    if(![rttiName(grid) isEqual:@"15GridUnitContent"] || unslide(readPointer(grid))!=0x1013e2810)return fail(@"Grid model identity mismatch");
+    uintptr_t editor=readPointer(grid+0x148);
+    if(!editor || editor!=readPointer(target+0x48) || !rttiName(editor))return fail(@"Editor model identity mismatch");
+    uint8_t loaded=0;
+    if(!grid || !editor || !safeRead(editor+0x278,&loaded,1) || !loaded)return fail(@"Grid model is not loaded");
+    return editor;
+}
+- (NSArray *)routingForGridNode:(id)node failure:(NSString **)failure {
+    uintptr_t editor=[self gridEditorForNode:node failure:failure];if(!editor)return nil;
+    // Preset grid: 84 records {u16 effect, u16 incomingMask}; incoming
+    // mask bits select rows in the immediately preceding column.
+    uint16_t records[168]={};
+    pthread_mutex_t *mutex=(pthread_mutex_t *)(editor+0x500);
+    // Inspection runs on the AppKit thread, including startup calibration.
+    // Never wait for MIDI/model work while holding up the editor run loop.
+    if(pthread_mutex_trylock(mutex)!=0) {if(failure)*failure=@"Grid routing model is busy; inspect again";return nil;}
+    BOOL read=safeRead(editor+0x3ac,records,sizeof records);
+    pthread_mutex_unlock(mutex);
+    if(!read) {if(failure)*failure=@"Grid routing read failed";return nil;}
+    NSMutableArray *cables=[NSMutableArray array];
+    for(unsigned cell=0;cell<84;++cell) {
+        unsigned mask=records[cell*2+1];
+        if(mask&~63u || (cell<6 && mask)) {if(failure)*failure=@"Grid routing mask is invalid";return nil;}
+        for(unsigned row=0;row<6;++row)if(mask&(1u<<row))
+            [cables addObject:@{@"source_row":@(row),@"source_column":@(cell/6-1),@"destination_row":@(cell%6),@"destination_column":@(cell/6)}];
+    }
+    return cables;
+}
+- (BOOL)setCableFromNode:(id)source toNode:(id)destination connected:(BOOL)connected failure:(NSString **)failure {
+    auto fail=[&](NSString *why)->BOOL {if(failure)*failure=why;return NO;};
+    uintptr_t editor=[self gridEditorForNode:source failure:failure];
+    if(!editor)return NO;
+    if(editor!=[self gridEditorForNode:destination failure:failure])return fail(@"Cable endpoints belong to different grid models");
+    auto cellFor=[&](id node,int *row,int *column)->BOOL {
+        Ivar ivar=class_getInstanceVariable([node class],"handler");uintptr_t handler=0;
+        if(!ivar || !safeRead((uintptr_t)(__bridge void *)node+ivar_getOffset(ivar),&handler,8))return NO;
+        uintptr_t block=readPointer(handler+8);uint16_t effect=0;
+        return safeRead(block+0x210,row,4) && safeRead(block+0x214,column,4) && safeRead(block+0x340,&effect,2) && effect!=0;
+    };
+    int sr=-1,sc=-1,dr=-1,dc=-1;
+    if(!cellFor(source,&sr,&sc) || !cellFor(destination,&dr,&dc) || sr<0 || sr>5 || dr<0 || dr>5 || sc<0 || sc>12 || dc!=sc+1)return fail(@"Cable endpoints must be occupied cells in adjacent columns");
+    uint8_t pending=0;uintptr_t oldBuffer=0;
+    if(!safeRead(editor+0x6920,&pending,1) || pending || !safeRead(editor+0x6a68,&oldBuffer,8))return fail(@"Another native cable operation is pending; inspect and retry later");
+    if(oldBuffer && malloc_size((void *)oldBuffer)<8)return fail(@"Native cable buffer ownership is not verified");
+    uint64_t *records=(uint64_t *)calloc(8,sizeof(uint64_t));
+    if(!records)return fail(@"Cannot allocate native cable command");
+    records[0]=(uint64_t)(sc*6+sr) | ((uint64_t)(dc*6+dr)<<8) | ((uint64_t)(connected ? 1 : 2)<<32);
+    // Mirrors native grid drag 0x10019c884 and delete 0x10019ba24:
+    // schedule the editor's cable operation, then replace its owned record array.
+    // This uses the editor operation lifecycle; never writes the preset grid.
+    ((void (*)(void *,void *))slid(0x1000de450))((void *)editor,(void *)(editor+0x6918));
+    // The initializer resets the operation, so retrieve the buffer it now owns.
+    oldBuffer=readPointer(editor+0x6a68);
+    *(uintptr_t *)(editor+0x6a68)=(uintptr_t)records;
+    *(uint32_t *)(editor+0x6a70)=8;
+    *(uint32_t *)(editor+0x6a74)=1;
+    free((void *)oldBuffer);
+    return YES;
+}
+- (NSNumber *)effectIDForGridNode:(id)node {
+    if(!self.nativeBlockEditingAvailable)return nil;
+    Ivar ivar=node ? class_getInstanceVariable([node class],"handler") : nullptr;
+    uintptr_t handler=0;
+    if(!ivar || !safeRead((uintptr_t)(__bridge void *)node+ivar_getOffset(ivar),&handler,8))return nil;
+    uintptr_t block=readPointer(handler+8);uint16_t effect=0;
+    if(![rttiName(block) isEqual:@"16A3BlockComponent"] || unslide(readPointer(block))!=0x1013e9238 || !safeRead(block+0x340,&effect,2))return nil;
+    return @(effect);
+}
+- (BOOL)editBlockNode:(id)node effectID:(NSInteger)effectID failure:(NSString **)failure {
+    auto fail=[&](NSString *why)->BOOL {if(failure)*failure=why;return NO;};
+    if(!NSThread.isMainThread || !self.nativeBlockEditingAvailable)return fail(@"Native block editing requires Axe-Edit 1.15.04 arm64");
+    Ivar ivar=node ? class_getInstanceVariable([node class],"handler") : nullptr;
+    uintptr_t handler=0;
+    if(!ivar || !safeRead((uintptr_t)(__bridge void *)node+ivar_getOffset(ivar),&handler,8))return fail(@"Grid accessibility handler unavailable");
+    uintptr_t block=readPointer(handler+8);
+    if(![rttiName(block) isEqual:@"16A3BlockComponent"] || unslide(readPointer(block))!=0x1013e9238)return fail(@"Grid component identity mismatch");
+    uintptr_t target=readPointer(block+0x388);
+    if(![rttiName(target) isEqual:@"17Gen3CommandTarget"] || unslide(readPointer(readPointer(target)+0x28))!=0x1000b6810)return fail(@"Grid command target mismatch");
+    if(effectID<0 || effectID>0xffff || (effectID && !insertableInstance((uint16_t)effectID)))return fail(@"Unsupported effect instance ID");
+    // The public tool requires a separately selected, inspected single cell.
+    struct {uint32_t command, flags, method; uint8_t rest[40];} record={};
+    record.command=effectID ? (2000u | ((uint32_t)effectID<<16)) : 1203u;
+    record.method=2;
+    return ((bool (*)(void *,const void *))slid(0x1000b6810))((void *)target,&record);
 }
 - (BOOL)layoutKnown {
     return _profile.knobParent>=0 && _profile.knobEffect>=0 && _profile.knobMin>=0 && _profile.undoOffset>=0;

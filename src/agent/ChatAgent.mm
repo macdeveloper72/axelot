@@ -66,7 +66,7 @@ static NSArray<NSString *> *disabledFeatures(void) {
 }
 - (void)persist {
     if (!self.directory) return;
-    NSDictionary *state = @{@"version":@3, @"provider":self.provider, @"session":self.session ?: @"", @"messages":self.entries};
+    NSDictionary *state = @{@"version":@7, @"provider":self.provider, @"session":self.session ?: @"", @"messages":self.entries};
     NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
     NSURL *file = [self.directory URLByAppendingPathComponent:@"conversation.json"];
     NSError *error = nil;
@@ -189,9 +189,9 @@ static NSArray<NSString *> *disabledFeatures(void) {
         }
     }
     self.session = [state isKindOfClass:NSDictionary.class] && [state[@"session"] isKindOfClass:NSString.class] ? state[@"session"] : nil;
-    // Start a new agent session on the tool-enabled protocol upgrade. Retain
-    // the local transcript, rather than resuming a chat-only tool contract.
-    if(![state[@"version"] isEqual:@3]) self.session=nil;
+    // Version 7 adds I/O blocks, readback polling and tone-building guidance to the tool contract.
+    // Preserve the transcript, but never resume an older tool registry.
+    if(![state[@"version"] isEqual:@7]) self.session=nil;
     self.connected = YES; self.busy = YES; self.ready = NO;
     self.status = [NSString stringWithFormat:@"Connecting to local %@…", self.provider]; [self notify];
     if ([self.provider isEqual:@"Codex"]) [self connectCodex];

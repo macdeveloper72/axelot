@@ -8,6 +8,11 @@ typedef void (^AxeToolReply)(NSDictionary *result);
 - (NSDictionary *)parameterForAccessibilityNode:(id)node failure:(NSString **)failure;
 - (BOOL)setDisplayValue:(double)value forAccessibilityNode:(id)node failure:(NSString **)failure;
 @optional
+- (BOOL)nativeBlockEditingAvailable;
+- (NSArray *)routingForGridNode:(id)node failure:(NSString **)failure;
+- (BOOL)setCableFromNode:(id)source toNode:(id)destination connected:(BOOL)connected failure:(NSString **)failure;
+- (NSNumber *)effectIDForGridNode:(id)node;
+- (BOOL)editBlockNode:(id)node effectID:(NSInteger)effectID failure:(NSString **)failure;
 /// Whether this writer supports the native bypass action for the current build.
 - (BOOL)nativeBypassAvailable;
 /// Set the selected effect's bypass through the editor's native toggle action.

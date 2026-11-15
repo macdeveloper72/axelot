@@ -115,6 +115,17 @@ Re-run it after pulling changes; it asks before replacing the previous copy.
 6. **Arrange:** drag the panel's edge to widen it. The title-bar icon detaches
    it into a free window and docks it back.
 
+### Grid editing tools
+
+On Axe-Edit III 1.15.04 arm64, the agent has block insertion/removal and
+`axefx_connect_blocks` / `axefx_disconnect_blocks` tools. Cable endpoints must
+be occupied cells in adjacent columns, left to right. The agent inspects the
+complete cable graph after each edit; gaps require shunts. Capability flags
+report whether the native model can be inspected on the running build.
+These tools edit the current preset buffer; Save remains manual. Native cable
+editing and Undo still require live acceptance; fixture tests do not establish
+hardware behavior. See [investigation and acceptance status](doc/BLOCK_EDIT_INVESTIGATION.md).
+
 ## Safety
 
 - **Knob changes are normal Axe-Edit edits.** They go through the same command
