@@ -66,7 +66,7 @@ static NSArray<NSString *> *disabledFeatures(void) {
 }
 - (void)persist {
     if (!self.directory) return;
-    NSDictionary *state = @{@"version":@7, @"provider":self.provider, @"session":self.session ?: @"", @"messages":self.entries};
+    NSDictionary *state = @{@"version":@8, @"provider":self.provider, @"session":self.session ?: @"", @"messages":self.entries};
     NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
     NSURL *file = [self.directory URLByAppendingPathComponent:@"conversation.json"];
     NSError *error = nil;
@@ -189,9 +189,9 @@ static NSArray<NSString *> *disabledFeatures(void) {
         }
     }
     self.session = [state isKindOfClass:NSDictionary.class] && [state[@"session"] isKindOfClass:NSString.class] ? state[@"session"] : nil;
-    // Version 7 adds I/O blocks, readback polling and tone-building guidance to the tool contract.
+    // Version 8 enables web search/fetch (read-only research) for the agent to the tool contract.
     // Preserve the transcript, but never resume an older tool registry.
-    if(![state[@"version"] isEqual:@7]) self.session=nil;
+    if(![state[@"version"] isEqual:@8]) self.session=nil;
     self.connected = YES; self.busy = YES; self.ready = NO;
     self.status = [NSString stringWithFormat:@"Connecting to local %@…", self.provider]; [self notify];
     if ([self.provider isEqual:@"Codex"]) [self connectCodex];
@@ -200,7 +200,7 @@ static NSArray<NSString *> *disabledFeatures(void) {
 - (void)connectCodex {
     NSMutableArray *arguments = [NSMutableArray arrayWithArray:@[@"app-server", @"--stdio"]];
     for (NSString *feature in disabledFeatures()) [arguments addObjectsFromArray:@[@"-c", [NSString stringWithFormat:@"features.%@=false", feature]]];
-    [arguments addObjectsFromArray:@[@"-c", @"features.code_mode_host=true", @"-c", @"web_search=\"disabled\""]];
+    [arguments addObjectsFromArray:@[@"-c", @"features.code_mode_host=true", @"-c", @"web_search=\"live\""]];
     __weak AxeChatAgent *weakSelf = self;
     [self launch:arguments line:^(NSDictionary *value) { [weakSelf codexEvent:value]; }
         ended:^(int code) { [weakSelf fail:@"Codex disconnected. Reconnect to continue."]; }];
@@ -209,7 +209,7 @@ static NSArray<NSString *> *disabledFeatures(void) {
         AxeChatAgent *agent = weakSelf;
         [agent write:@{@"method":@"initialized", @"params":@{}}];
         [agent request:@"config/read" params:@{@"includeLayers":@NO} reply:^(NSDictionary *loaded) {
-            NSMutableDictionary *config = [@{@"web_search":@"disabled"} mutableCopy];
+            NSMutableDictionary *config = [@{@"web_search":@"live"} mutableCopy];
             for (NSString *feature in disabledFeatures()) {
                 if (![loaded[@"config"][@"features"][feature] isEqual:@NO]) { [weakSelf fail:@"Codex did not confirm disabled built-in tools."]; return; }
                 config[[NSString stringWithFormat:@"features.%@", feature]] = @NO;
@@ -346,9 +346,10 @@ static NSArray<NSString *> *disabledFeatures(void) {
         if(![self configureMCP])return;
         self.claudeMessageID = NSUUID.UUID.UUIDString; self.receivedResult = NO;
         NSMutableArray *args = [NSMutableArray arrayWithArray:@[@"--restricted", @"--print", @"--verbose", @"--output-format", @"stream-json", @"--include-partial-messages",
-            @"--tools", @"", @"--strict-mcp-config", @"--mcp-config", self.mcpConfig.path, @"--setting-sources", @"", @"--disable-slash-commands",
+            @"--tools", @"WebSearch,WebFetch", @"--strict-mcp-config", @"--mcp-config", self.mcpConfig.path, @"--setting-sources", @"", @"--disable-slash-commands",
             @"--settings", @"{\"disableAllHooks\":true}", @"--permission-mode", @"dontAsk", @"--permission-prompts", @"none", @"--no-chrome", @"--max-turns", @"12", @"--system-prompt-snapshot", @"off", @"--system-prompt", [AxeEditorTools systemPrompt]]];
         NSMutableArray *allowed=[NSMutableArray array];for(NSDictionary *spec in [AxeEditorTools specifications]) [allowed addObject:[@"mcp__axe_edit__" stringByAppendingString:spec[@"name"]]];
+        [allowed addObjectsFromArray:@[@"WebSearch",@"WebFetch"]];
         [args addObjectsFromArray:@[@"--allowedTools",[allowed componentsJoinedByString:@","]]];
         if (self.session.length) [args addObjectsFromArray:@[@"--resume", self.session]];
         [self launch:args line:^(NSDictionary *value) { [weakSelf claudeEvent:value]; } ended:^(int code) {
